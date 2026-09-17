@@ -463,6 +463,38 @@ def test_aligned_twist_is_zero_at_usd_bind_pose_not_rest_pose():
     assert torch.rad2deg(rest_twist.abs()).max().item() > 1.0
 
 
+@pytest.mark.cpu
+@pytest.mark.asset_heavy
+def test_aligned_twist_is_invariant_to_world_rotation_near_pi():
+    rig = load_lod_rig_from_usd(TEMPLATE_RIG, "low")
+    source_names = list(PROCEDURAL_TRANSFORM_DEFINITION.public_joint_names)
+    target_names = [str(name) for name in rig["joint_names"]]
+    transform = _make_parameter_transform(
+        source_names,
+        target_names,
+        target_t_pose_world=torch.from_numpy(rig["t_pose_world"]),
+        target_joint_parent_ids=rig["joint_parent_ids"],
+        target_bind_pose_world=torch.from_numpy(rig["bind_pose_world"]),
+    )
+    source_target_ids = torch.tensor([target_names.index(name) for name in source_names])
+    bind_world = torch.from_numpy(rig["bind_pose_world"])[source_target_ids].unsqueeze(0)
+    angles = torch.pi - torch.tensor([1e-3, 1e-5, 1e-7, 0.0], dtype=torch.float64)
+    axis = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float64)
+    axis = axis / axis.norm()
+    near_pi = batch_rodrigues(angles[:, None] * axis, dtype=torch.float64).float()
+    # Put the hand near a mixed-axis half turn while rotating the entire rig rigidly.
+    hand_bind_rotation = bind_world[0, source_names.index("LeftHand"), :3, :3]
+    world_rotation = torch.eye(4).repeat(len(angles), 1, 1)
+    world_rotation[:, :3, :3] = near_pi @ hand_bind_rotation.T
+    rotated_world = world_rotation[:, None] @ bind_world
+    source_rotations = _identity_rotations(len(angles), len(source_names))
+
+    expected = transform.twist_rotations_from_source(source_rotations[:1], bind_world)
+    actual = transform.twist_rotations_from_source(source_rotations, rotated_world)
+
+    torch.testing.assert_close(actual, expected.expand_as(actual), atol=1e-5, rtol=0.0)
+
+
 def test_definition_parser_reports_invalid_axis():
     data = _definition_data()
     data["segments"][0]["source_axis"] = "roll"

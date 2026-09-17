@@ -176,6 +176,11 @@ from ..procedural_transforms import (
     derive_soma_rig_without_procedural_joints,
     load_soma_procedural_transform_definition,
 )
+from ..reference_poses import (
+    ReferencePoseHistory,
+    convert_reference_rotations,
+    validate_reference_pose,
+)
 from ..units import Unit
 from .identity_model import SOMAHandIdentityModel
 
@@ -400,6 +405,8 @@ class SOMAHandLayer(nn.Module):
         low_lod: bool = False,
         load_correctives_model: bool | None = None,
         correctives_model_path: str | Path | None = _DEFAULT_CORRECTIVES_MODEL_PATH,
+        *,
+        reference_pose: torch.Tensor | dict[str, str] | None = None,
     ) -> None:
         """Build a SOMAHandLayer with the selected identity backend.
 
@@ -434,6 +441,9 @@ class SOMAHandLayer(nn.Module):
             correctives_model_path: Path to a pose-corrective checkpoint. Defaults
                 to ``data_root/correctives_model.pt``. Pass ``None`` to skip
                 loading correctives.
+            reference_pose: Default reference tensor or lookup dictionary for
+                :meth:`pose` and :meth:`forward`. Dictionaries resolve once.
+                ``None`` uses the current T-pose. See :meth:`pose` for tensor shapes.
         """
         super().__init__()
         if hand_type not in ("left", "right"):
@@ -494,6 +504,7 @@ class SOMAHandLayer(nn.Module):
                 "Run 'git lfs pull' to fetch LFS-tracked files."
             )
         _rig = dict(np.load(core_asset, allow_pickle=False))
+        self._reference_pose_history = ReferencePoseHistory(_rig)
         definition_path = data_root / SOMA_PROCEDURAL_TRANSFORM_DEFINITION_FILENAME
         public_joint_names = _public_joint_names_from_assets(
             _rig,
@@ -525,6 +536,13 @@ class SOMAHandLayer(nn.Module):
             )
 
         hj = hand_joint_ids  # (25,) global joint indices
+
+        self._reference_body_joint_names = tuple(str(name) for name in _rig["joint_names"])
+        self.register_buffer(
+            "_reference_body_parent_ids",
+            torch.tensor(_rig["joint_parent_ids"], dtype=torch.long, device=device),
+            persistent=False,
+        )
 
         bind_pose = _rig["bind_pose_world"].astype(np.float64)  # (78,4,4) cm
         t_pose = _rig["t_pose_world"].astype(np.float64)  # (78,4,4) cm
@@ -777,6 +795,15 @@ class SOMAHandLayer(nn.Module):
         hand_joint_names = [str(_rig["joint_names"][gid]) for gid in hand_joint_ids]
         self.rig_data = {"joint_names": hand_joint_names}
 
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
+        if reference_pose is not None:
+            reference_pose = validate_reference_pose(
+                reference_pose, 25, require_identity_root=False
+            )
+            reference_pose = reference_pose.to(self.bind_pose_world)
+        self.register_buffer("_default_reference_pose", reference_pose, persistent=False)
+
         self._cached_identity_rest_shape = None
         self._cached_correctives_rest_shape = None
         self._cached_rest_shape = None
@@ -824,6 +851,75 @@ class SOMAHandLayer(nn.Module):
     def num_shape_components(self) -> int:
         """Number of identity coefficients."""
         return self.identity_model.num_identity_coeffs
+
+    def list_reference_poses(self) -> list[dict[str, Any]]:
+        """List reference keys and metadata in the current core NPZ."""
+        return self._reference_pose_history.list_reference_poses()
+
+    def get_reference_pose(
+        self,
+        reference_id: str | None = None,
+        *,
+        version: str | None = None,
+        data_key: str = "t_pose_world",
+        asset_revision: str | None = None,
+        alias: str | None = None,
+    ) -> torch.Tensor:
+        """Return saved orientations for this hand, including the wrist.
+
+        Select one of ``version``, ``asset_revision``, ``alias``, or ``reference_id``.
+        Version lookup uses the newest stored revision at or before that version;
+        full keys and asset revisions match exactly. No downloads are used.
+
+        The fresh ``(25, 3, 3)`` tensor uses this layer's joint order, device,
+        dtype, and current wrist bind frame. Translations are not included.
+        """
+        reference_id = self._reference_pose_history.resolve_reference_id(
+            reference_id,
+            soma_version=version,
+            data_key=data_key,
+            asset_revision=asset_revision,
+            alias=alias,
+        )
+        body_reference = self._reference_pose_history.get_reference_pose(
+            reference_id,
+            self._reference_body_joint_names,
+            self._reference_body_parent_ids,
+            device=self.bind_pose_world.device,
+            dtype=self.bind_pose_world.dtype,
+        )
+        hand_reference = body_reference[self.hand_joint_ids_global]
+        # Scalar products preserve SO(3) precision even when TF32 matmul is enabled.
+        return (
+            self._correctives_to_hand_frame[None, :, :, None] * hand_reference[:, None, :, :]
+        ).sum(dim=2)
+
+    def convert_reference(
+        self,
+        rotations: torch.Tensor,
+        from_ref: torch.Tensor | dict[str, str],
+        to_ref: torch.Tensor | dict[str, str],
+    ) -> torch.Tensor:
+        """Re-express ``(B, 25, 3, 3)`` rotations in another reference.
+
+        Both references accept a tensor or :meth:`get_reference_pose` dictionary:
+        orientations in this layer's wrist bind frame, including the wrist.
+        The result preserves absolute local rotations, input device/dtype and
+        gradients. No identity preparation or layer state changes are needed.
+        References are explicit; the constructor default is not used.
+        Pass the result to ``pose(..., pose2rot=False, reference_pose=to_ref)``.
+        """
+        if isinstance(from_ref, dict):
+            from_ref = self.get_reference_pose(**from_ref)
+        if isinstance(to_ref, dict):
+            to_ref = self.get_reference_pose(**to_ref)
+        return convert_reference_rotations(
+            rotations,
+            from_ref,
+            to_ref,
+            self.joint_parent_ids,
+            virtual_root=False,
+        )
 
     def _apply_lod_transfer(self, mid_rest_shape: torch.Tensor) -> torch.Tensor:
         if self.identity_lod_mid_ids is not None:
@@ -959,6 +1055,8 @@ class SOMAHandLayer(nn.Module):
         absolute_pose: bool = False,
         global_translation: torch.Tensor | None = None,
         fk_only: bool = False,
+        *,
+        reference_pose: torch.Tensor | dict[str, str] | None = None,
     ) -> SOMAHandPoseOutput:
         """Pose the cached identity. Call prepare_identity() first.
 
@@ -977,6 +1075,13 @@ class SOMAHandLayer(nn.Module):
             global_translation: (B, 3) or (3,) wrist translation in
                 output_unit. If None, wrist stays at origin.
             fk_only: if True, run forward kinematics only and skip LBS.
+            reference_pose: ``None`` uses the constructor default, or the current
+                T-pose if none was set. Otherwise, a
+                dictionary of :meth:`get_reference_pose` arguments or a
+                ``(25, 3, 3)`` / ``(25, 4, 4)`` tensor of orientations in
+                this hand's joint order and current wrist bind frame. Only
+                rotation blocks are used. ``absolute_pose=True`` bypasses the
+                stored default but rejects an explicit reference.
 
         Returns:
             SOMAHandPoseOutput (all translations in `output_unit`):
@@ -985,6 +1090,16 @@ class SOMAHandLayer(nn.Module):
             - `joints`: (B, 25, 3).
             - `transforms`: (B, 25, 4, 4).
         """
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if reference_pose is None and not absolute_pose:
+            reference_pose = self._default_reference_pose
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
+        if reference_pose is not None:
+            reference_pose = validate_reference_pose(
+                reference_pose, 25, require_identity_root=False
+            )
         if self._cached_rest_shape is None or self._cached_bind_transforms_world is None:
             raise RuntimeError("No cached identity. Call prepare_identity() before pose().")
 
@@ -994,6 +1109,14 @@ class SOMAHandLayer(nn.Module):
             poses_rot = batch_rodrigues(poses.reshape(-1, 3)).reshape(B, 25, 3, 3)
         else:
             poses_rot = poses.reshape(B, 25, 3, 3)
+
+        if reference_pose is not None:
+            orient, parent_t = precompute_joint_orient(
+                reference_pose.to(poses_rot),
+                self.joint_parent_ids.to(poses_rot.device),
+            )
+            poses_rot = apply_joint_orient_local(poses_rot, orient, parent_t)
+            absolute_pose = True
 
         if global_translation is not None:
             global_translation = global_translation.to(
@@ -1088,6 +1211,8 @@ class SOMAHandLayer(nn.Module):
         global_scale: float | torch.Tensor = 1.0,
         scale_params: torch.Tensor | None = None,
         kwargs: Mapping[str, Any] | None = None,
+        *,
+        reference_pose: torch.Tensor | dict[str, str] | None = None,
     ) -> SOMAHandPoseOutput:
         """Combined prepare_identity + pose (convenience).
 
@@ -1106,6 +1231,7 @@ class SOMAHandLayer(nn.Module):
                 (SOMA: (B, 24); MHR: (B, 26); MANO: unused). See class docstring.
             kwargs: optional dict forwarded to the identity model's
                 `get_rest_shape`.
+            reference_pose: Reference tensor or lookup dictionary, as in :meth:`pose`.
 
         Returns:
             SOMAHandPoseOutput (all translations in `output_unit`):
@@ -1114,6 +1240,10 @@ class SOMAHandLayer(nn.Module):
             - `joints`: (B, 25, 3).
             - `transforms`: (B, 25, 4, 4).
         """
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
         self.prepare_identity(
             identity_coeffs,
             scale_params=scale_params,
@@ -1127,4 +1257,5 @@ class SOMAHandLayer(nn.Module):
             apply_correctives=apply_correctives,
             absolute_pose=absolute_pose,
             global_translation=global_translation,
+            reference_pose=reference_pose,
         )

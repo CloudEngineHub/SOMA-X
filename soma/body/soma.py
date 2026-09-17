@@ -272,6 +272,11 @@ from ..procedural_transforms import (
     has_soma_twist_joints,
     load_soma_procedural_transform_definition,
 )
+from ..reference_poses import (
+    ReferencePoseHistory,
+    convert_reference_rotations,
+    validate_reference_pose,
+)
 from ..units import Unit
 from .identity_model import create_identity_model
 
@@ -467,6 +472,8 @@ class SOMALayer(nn.Module):
         enable_procedural_transforms: bool = True,
         load_correctives_model: bool | None = None,
         correctives_model_path: str | Path | None = _DEFAULT_CORRECTIVES_MODEL_PATH,
+        *,
+        reference_pose: torch.Tensor | dict[str, str] | None = None,
     ) -> None:
         """Build a SOMALayer with the selected identity backend.
 
@@ -512,6 +519,9 @@ class SOMALayer(nn.Module):
             correctives_model_path: Path to a pose-corrective checkpoint. Defaults
                 to ``data_root/correctives_model.pt`` when procedural transforms
                 are enabled. Pass ``None`` to skip loading correctives.
+            reference_pose: Default reference tensor or lookup dictionary for
+                :meth:`pose` and :meth:`forward`. Dictionaries resolve once.
+                ``None`` uses the current T-pose. See :meth:`pose` for tensor shapes.
         """
         super().__init__()
 
@@ -554,6 +564,8 @@ class SOMALayer(nn.Module):
                 f"Error loading core asset 'SOMA_neutral.npz': {e}\n"
                 "Please ensure the assets are correctly downloaded with 'git lfs pull'."
             ) from e
+
+        self._reference_pose_history = ReferencePoseHistory(self.rig_data)
 
         self.procedural_transforms_enabled = enable_procedural_transforms
         self.procedural_template_rig_path = None
@@ -1062,6 +1074,13 @@ class SOMALayer(nn.Module):
             self._t_pose_orient = None
             self._t_pose_orient_parent_T = None
 
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
+        if reference_pose is not None:
+            reference_pose = validate_reference_pose(reference_pose, len(self.public_joint_names))
+            reference_pose = reference_pose.to(self.bind_pose_world)
+        self.register_buffer("_default_reference_pose", reference_pose, persistent=False)
+
         self._cached_identity_rest_shape = None
         self._cached_rest_shape = None
         self._cached_bind_transforms_world = None
@@ -1092,6 +1111,81 @@ class SOMALayer(nn.Module):
     def output_joint_parent_ids(self) -> torch.Tensor:
         """Parent ids for the public transforms returned by :meth:`pose`."""
         return self.public_joint_parent_ids
+
+    def list_reference_poses(self) -> list[dict[str, Any]]:
+        """List reference IDs and descriptive metadata shipped in the current NPZ.
+
+        Each record includes its NPZ key, data key and reference revision or asset
+        revision selector. Returned dictionaries are independent copies. Older assets
+        without a reference history return an empty list; no historical assets are fetched.
+        """
+        return self._reference_pose_history.list_reference_poses()
+
+    def get_reference_pose(
+        self,
+        reference_id: str | None = None,
+        *,
+        version: str | None = None,
+        data_key: str = "t_pose_world",
+        asset_revision: str | None = None,
+        alias: str | None = None,
+    ) -> torch.Tensor:
+        """Return a saved reference's world rotations in current public joint order.
+
+        Select exactly one of ``version`` (e.g. ``"v0.3.0"``), an
+        ``asset_revision``, an ``alias`` listed in the catalog, or a direct ``reference_id``.
+        Version lookup selects the newest stored revision of ``data_key`` at
+        or before the requested semantic version (optional leading ``v``).
+        Full NPZ keys and asset revisions match exactly. No downloads are used.
+        ``t_pose_world`` selects public world orientation
+        blocks, not historical translations or the full internal rig.
+
+        The returned ``(J, 3, 3)`` tensor includes virtual Root and is a fresh
+        copy on this layer's device and dtype. This does not require a prepared
+        identity. Raises ``KeyError`` for an unknown lookup and ``ValueError``
+        for conflicting selectors or an incompatible public name/hierarchy mapping.
+        """
+        reference_id = self._reference_pose_history.resolve_reference_id(
+            reference_id,
+            soma_version=version,
+            data_key=data_key,
+            asset_revision=asset_revision,
+            alias=alias,
+        )
+        return self._reference_pose_history.get_reference_pose(
+            reference_id,
+            self.public_joint_names,
+            self.output_joint_parent_ids,
+            device=self.bind_pose_world.device,
+            dtype=self.bind_pose_world.dtype,
+        )
+
+    def convert_reference(
+        self,
+        rotations: torch.Tensor,
+        from_ref: torch.Tensor | dict[str, str],
+        to_ref: torch.Tensor | dict[str, str],
+    ) -> torch.Tensor:
+        """Re-express ``(B, 77, 3, 3)`` rotations in another reference.
+
+        Both references accept a tensor or :meth:`get_reference_pose` dictionary:
+        body world orientations including identity virtual Root.
+        The result preserves absolute local rotations, input device/dtype and
+        gradients. No identity preparation or layer state changes are needed.
+        References are explicit; the constructor default is not used.
+        Pass the result to ``pose(..., pose2rot=False, reference_pose=to_ref)``.
+        """
+        if isinstance(from_ref, dict):
+            from_ref = self.get_reference_pose(**from_ref)
+        if isinstance(to_ref, dict):
+            to_ref = self.get_reference_pose(**to_ref)
+        return convert_reference_rotations(
+            rotations,
+            from_ref,
+            to_ref,
+            self.output_joint_parent_ids,
+            virtual_root=True,
+        )
 
     def public_skinning_weights(self) -> torch.Tensor:
         """Return target skinning weights folded onto the public SOMA hierarchy."""
@@ -1493,6 +1587,8 @@ class SOMALayer(nn.Module):
         absolute_pose: bool = False,
         fk_only: bool = False,
         return_transforms: bool | None = None,
+        *,
+        reference_pose: torch.Tensor | dict[str, str] | None = None,
     ) -> SOMAPoseOutput:
         """Pose the cached identity. Call `prepare_identity()` first.
 
@@ -1510,6 +1606,16 @@ class SOMALayer(nn.Module):
             return_transforms: **deprecated** -- `"transforms"` is always
                 included in the result. Emits `DeprecationWarning` and
                 has no effect.
+            reference_pose: Optional dictionary of :meth:`get_reference_pose`
+                arguments, or ``(J, 3, 3)`` world orientations or
+                ``(J, 4, 4)`` transforms in ``public_joint_names`` order,
+                including identity virtual Root. One reference is shared across
+                the batch. Rotation blocks must be finite SO(3) matrices
+                (absolute tolerance 1e-4); translation blocks are ignored.
+                Overrides the input T-pose convention without changing bind
+                geometry or bone lengths. ``None`` uses the constructor default,
+                or the current T-pose if none was set. ``absolute_pose=True``
+                bypasses the stored default but rejects an explicit reference.
 
         Returns:
             SOMAPoseOutput (all translations in `output_unit`):
@@ -1520,6 +1626,14 @@ class SOMALayer(nn.Module):
               In procedural mode, internal twist-joint FK/LBS transforms are
               intentionally not returned.
         """
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if reference_pose is None and not absolute_pose:
+            reference_pose = self._default_reference_pose
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
+        if reference_pose is not None:
+            reference_pose = validate_reference_pose(reference_pose, len(self.public_joint_names))
         if return_transforms is not None:
             warnings.warn(
                 "return_transforms is deprecated; 'transforms' is always included in the result.",
@@ -1547,15 +1661,22 @@ class SOMALayer(nn.Module):
 
         poses_rot = self._pad_poses(poses_rot)
         public_poses_rot = poses_rot
-        public_absolute_rotations = (
-            public_poses_rot
-            if absolute_pose
-            else (
-                self.procedural_transforms.apply_source_joint_orient(public_poses_rot)
-                if self.procedural_transforms is not None
-                else self._apply_joint_orient(public_poses_rot)
+        if reference_pose is not None:
+            orient, parent_t = precompute_joint_orient(
+                reference_pose.to(public_poses_rot),
+                self.output_joint_parent_ids.to(public_poses_rot.device),
             )
-        )
+            public_absolute_rotations = apply_joint_orient_local(public_poses_rot, orient, parent_t)
+        else:
+            public_absolute_rotations = (
+                public_poses_rot
+                if absolute_pose
+                else (
+                    self.procedural_transforms.apply_source_joint_orient(public_poses_rot)
+                    if self.procedural_transforms is not None
+                    else self._apply_joint_orient(public_poses_rot)
+                )
+            )
 
         # Correctives are per-vertex offsets to rest_shape -- only needed when LBS runs.
         if apply_correctives and not fk_only:
@@ -1616,6 +1737,12 @@ class SOMALayer(nn.Module):
                 absolute_pose=True,
                 local_translations=public_local_t_override,
             )
+            # Source FK broadcasts a singleton pose over the identity batch;
+            # procedural expansion requires rotations with that same batch size.
+            if public_absolute_rotations.shape[0] == 1 and effective_batch > 1:
+                public_absolute_rotations = public_absolute_rotations.expand(
+                    effective_batch, -1, -1, -1
+                )
             T_world = self.batched_skinning.expand_source_world_transforms(
                 source_rotations=public_absolute_rotations,
                 source_world_transforms=public_world_transforms,
@@ -1659,6 +1786,8 @@ class SOMALayer(nn.Module):
         global_scale: float | torch.Tensor = 1.0,
         kwargs: Mapping[str, Any] | None = None,
         return_transforms: bool | None = None,
+        *,
+        reference_pose: torch.Tensor | dict[str, str] | None = None,
     ) -> SOMAPoseOutput:
         """Combined prepare_identity + pose (convenience).
 
@@ -1687,6 +1816,12 @@ class SOMALayer(nn.Module):
             return_transforms: **deprecated** -- `"transforms"` is always
                 included in the result. Emits `DeprecationWarning` and
                 has no effect.
+            reference_pose: Optional dictionary of :meth:`get_reference_pose`
+                arguments, or shared public-joint world orientations including
+                identity Root. Dictionaries resolve before preparing identity.
+                See :meth:`pose` for shapes and rotation validation.
+                ``None`` uses the constructor default. ``absolute_pose=True``
+                bypasses that default but rejects an explicit reference.
 
         Returns:
             SOMAPoseOutput (all translations in `output_unit`):
@@ -1697,6 +1832,10 @@ class SOMALayer(nn.Module):
               In procedural mode, internal twist-joint FK/LBS transforms are
               intentionally not returned.
         """
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
         if return_transforms is not None:
             warnings.warn(
                 "return_transforms is deprecated; 'transforms' is always included in the result.",
@@ -1716,4 +1855,5 @@ class SOMALayer(nn.Module):
             pose2rot=pose2rot,
             apply_correctives=apply_correctives,
             absolute_pose=absolute_pose,
+            reference_pose=reference_pose,
         )

@@ -530,6 +530,9 @@ def quaternion_xyzw_to_matrix(quaternion: torch.Tensor, eps: float = 1e-12) -> t
 def matrix_to_quaternion_xyzw(R: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """Convert rotation matrices to XYZW unit quaternions.
 
+    Recover all components together from the largest-component branch to preserve
+    their relative signs near 180 degrees and avoid zero-valued square roots.
+
     Args:
         R: (..., 3, 3) rotation matrices.
         eps: Small constant used when normalizing quaternions.
@@ -550,60 +553,46 @@ def matrix_to_quaternion_xyzw(R: torch.Tensor, eps: float = 1e-12) -> torch.Tens
     m21 = R[..., 2, 1]
     m22 = R[..., 2, 2]
 
-    qw = 0.5 * torch.sqrt((1.0 + m00 + m11 + m22).clamp_min(0.0))
-    qx = 0.5 * torch.copysign(
-        torch.sqrt((1.0 + m00 - m11 - m22).clamp_min(0.0)),
-        m21 - m12,
+    squared_components = torch.stack(
+        (
+            1.0 + m00 - m11 - m22,
+            1.0 - m00 + m11 - m22,
+            1.0 - m00 - m11 + m22,
+            1.0 + m00 + m11 + m22,
+        ),
+        dim=-1,
     )
-    qy = 0.5 * torch.copysign(
-        torch.sqrt((1.0 - m00 + m11 - m22).clamp_min(0.0)),
-        m02 - m20,
+    xx, yy, zz, ww = squared_components.unbind(dim=-1)
+    xy, xz, yz = m01 + m10, m02 + m20, m12 + m21
+    xw, yw, zw = m21 - m12, m02 - m20, m10 - m01
+    # Each row is 4 * q_i * q. For a unit quaternion, the largest |q_i|
+    # is at least 0.5, so its row can be normalized without a small divisor.
+    candidates = torch.stack(
+        (
+            torch.stack((xx, xy, xz, xw), dim=-1),
+            torch.stack((xy, yy, yz, yw), dim=-1),
+            torch.stack((xz, yz, zz, zw), dim=-1),
+            torch.stack((xw, yw, zw, ww), dim=-1),
+        ),
+        dim=-2,
     )
-    qz = 0.5 * torch.copysign(
-        torch.sqrt((1.0 - m00 - m11 + m22).clamp_min(0.0)),
-        m10 - m01,
-    )
-    return quaternion_normalize_xyzw(torch.stack((qx, qy, qz, qw), dim=-1), eps=eps)
+    largest = squared_components.argmax(dim=-1)
+    gather_ids = largest[..., None, None].expand(largest.shape + (1, 4))
+    quaternion = candidates.gather(-2, gather_ids).squeeze(-2)
+    return quaternion_standardize_xyzw(quaternion, eps=eps)
 
 
 def matrix_to_quaternion_xyzw_stable(
     R: torch.Tensor,
     eps: float = 1e-12,
 ) -> torch.Tensor:
-    """Convert rotation matrices to XYZW quaternions with finite sqrt gradients.
+    """Convert rotation matrices to XYZW quaternions with finite branch gradients.
 
-    This follows the same signed-branch convention as ``matrix_to_quaternion_xyzw``
-    but adds a tiny value inside each square root.  It is intended for code paths
-    that need gradients through matrix-to-quaternion conversion near zero-valued
-    branches.
+    The shared largest-component implementation avoids zero-valued square roots,
+    including at identity and 180-degree rotations. Keep this entry point for
+    callers that need gradients through matrix-to-quaternion conversion.
     """
-    if R.shape[-2:] != (3, 3):
-        raise ValueError(f"Expected (...,3,3), got {R.shape}")
-
-    m00 = R[..., 0, 0]
-    m01 = R[..., 0, 1]
-    m02 = R[..., 0, 2]
-    m10 = R[..., 1, 0]
-    m11 = R[..., 1, 1]
-    m12 = R[..., 1, 2]
-    m20 = R[..., 2, 0]
-    m21 = R[..., 2, 1]
-    m22 = R[..., 2, 2]
-
-    qw = 0.5 * torch.sqrt((1.0 + m00 + m11 + m22).clamp_min(0.0) + eps)
-    qx = 0.5 * torch.copysign(
-        torch.sqrt((1.0 + m00 - m11 - m22).clamp_min(0.0) + eps),
-        m21 - m12,
-    )
-    qy = 0.5 * torch.copysign(
-        torch.sqrt((1.0 - m00 + m11 - m22).clamp_min(0.0) + eps),
-        m02 - m20,
-    )
-    qz = 0.5 * torch.copysign(
-        torch.sqrt((1.0 - m00 - m11 + m22).clamp_min(0.0) + eps),
-        m10 - m01,
-    )
-    return quaternion_normalize_xyzw(torch.stack((qx, qy, qz, qw), dim=-1), eps=eps)
+    return matrix_to_quaternion_xyzw(R, eps=eps)
 
 
 def single_axis_rotation_matrices(

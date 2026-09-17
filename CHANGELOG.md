@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.1
+
+Changes from v0.3.0:
+
+- Adds `reference_pose=` to `SOMALayer` and `SOMAHandLayer`, as a constructor
+  default or per-call override, and `convert_reference()` to express pose
+  rotations in another reference.
+- Makes historical T-pose orientations available from current assets through
+  `get_reference_pose(version=...)`, without downloading older releases.
+- Fixes matrix-to-quaternion conversion at and near 180-degree rotations and
+  keeps gradients finite at identity and 180 degrees.
+
 ## v0.3.0
 
 Changes from v0.2.4:

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
 import torch
 
 from soma.geometry.lbs import batch_rodrigues
@@ -76,6 +77,74 @@ def test_matrix_to_quaternion_xyzw_stable_matches_standard_converter():
     actual = matrix_to_quaternion_xyzw_stable(rotations)
 
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("converter", [matrix_to_quaternion_xyzw, matrix_to_quaternion_xyzw_stable])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_matrix_to_quaternion_round_trips_mixed_sign_pi_rotations(converter, dtype):
+    axes = torch.tensor([[1.0, -1.0, 0.0], [-1.0, 2.0, 3.0], [3.0, 1.0, -2.0]], dtype=dtype)
+    axes = axes / axes.norm(dim=-1, keepdim=True)
+    # Symmetric matrices have no antisymmetric terms from which to infer axis signs.
+    rotations = 2.0 * axes[..., :, None] * axes[..., None, :] - torch.eye(3, dtype=dtype)
+    quaternions = converter(rotations)
+
+    assert torch.all(quaternions[..., 3] >= 0.0)
+    torch.testing.assert_close(quaternions.norm(dim=-1), torch.ones(3, dtype=dtype))
+    torch.testing.assert_close(
+        quaternion_xyzw_to_matrix(quaternions), rotations, atol=1e-6, rtol=1e-6
+    )
+
+
+@pytest.mark.parametrize("converter", [matrix_to_quaternion_xyzw, matrix_to_quaternion_xyzw_stable])
+def test_matrix_to_quaternion_round_trips_near_pi_and_mirrored_rotations(converter):
+    axes = torch.tensor([[1.0, -2.0, 3.0], [-3.0, 1.0, 2.0]], dtype=torch.float64)
+    axes = axes / axes.norm(dim=-1, keepdim=True)
+    offsets = torch.tensor([-1e-3, -1e-5, -1e-7, 1e-7, 1e-5, 1e-3], dtype=torch.float64)
+    rotations = batch_rodrigues(((torch.pi + offsets[:, None, None]) * axes).reshape(-1, 3))
+    rotations = rotations.to(torch.float32).reshape(6, 2, 3, 3)
+    mirror = torch.diag(torch.tensor([-1.0, 1.0, 1.0]))
+    rotations = torch.stack((rotations, mirror @ rotations @ mirror))
+
+    quaternions = converter(rotations)
+
+    assert quaternions.shape == (2, 6, 2, 4)
+    assert quaternions.dtype == rotations.dtype
+    assert quaternions.device == rotations.device
+    assert torch.all(quaternions[..., 3] >= 0.0)
+    torch.testing.assert_close(
+        quaternion_xyzw_to_matrix(quaternions), rotations, atol=1e-6, rtol=1e-6
+    )
+
+
+@pytest.mark.parametrize("converter", [matrix_to_quaternion_xyzw, matrix_to_quaternion_xyzw_stable])
+def test_matrix_to_quaternion_has_finite_gradients_at_identity_and_pi(converter):
+    rotations = torch.stack(
+        (
+            torch.eye(3, dtype=torch.float64),
+            torch.diag(torch.tensor([1.0, -1.0, -1.0], dtype=torch.float64)),
+            torch.tensor(
+                [[0.0, -1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]], dtype=torch.float64
+            ),
+        )
+    ).requires_grad_(True)
+    quaternions = converter(rotations)
+    weights = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=rotations.dtype)
+    (quaternions * weights).sum().backward()
+
+    assert torch.isfinite(rotations.grad).all()
+    assert torch.all(rotations.grad.abs().sum(dim=(-2, -1)) > 0.0)
+
+
+@pytest.mark.parametrize("converter", [matrix_to_quaternion_xyzw, matrix_to_quaternion_xyzw_stable])
+def test_matrix_to_quaternion_gradcheck_away_from_branch_boundaries(converter):
+    rotations = batch_rodrigues(
+        torch.tensor(
+            [[0.2, -0.4, 0.7], [2.7, 0.1, -0.2], [0.1, 2.7, -0.2], [0.1, -0.2, 2.7]],
+            dtype=torch.float64,
+        )
+    ).requires_grad_(True)
+
+    assert torch.autograd.gradcheck(converter, (rotations,))
 
 
 def test_single_axis_rotation_matrices_match_rodrigues():
