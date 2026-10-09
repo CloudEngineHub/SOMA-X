@@ -163,12 +163,14 @@ from ..geometry.rig_utils import (
     apply_joint_orient_local,
     joint_world_to_local,
     precompute_joint_orient,
+    remove_joint_orient_local,
 )
 from ..geometry.skeleton_transfer import SkeletonTransfer
 from ..io import (
     SOMA_TEMPLATE_RIG_FILENAME,
     fan_triangulate,
     load_lod_rigs_from_usd,
+    load_soma_animation,
     missing_soma_neutral_rig_keys,
 )
 from ..procedural_transforms import (
@@ -921,6 +923,63 @@ class SOMAHandLayer(nn.Module):
             virtual_root=False,
         )
 
+    def load_motion(
+        self,
+        path: str | Path,
+        *,
+        absolute_pose: bool = False,
+        reference_pose: torch.Tensor | dict[str, str] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """Load full-body or hand-only USD motion for :meth:`pose`.
+
+        No prepared identity is needed. Joint leaf names must identify this
+        hand's 25 joints; authored paths define the source hierarchy. Full-body
+        wrist ancestors are composed before extracting the hand. A hand-only
+        animation's wrist root already supplies its world transform.
+
+        Args:
+            path: USD animation containing this hand's joints and any animated
+                ancestors. Translations are converted to this layer's output units.
+            absolute_pose: Return absolute rotations: world rotation for the
+                wrist, parent-local rotations for fingers. Bypasses the
+                constructor's default reference pose.
+            reference_pose: Same tensor or :meth:`get_reference_pose` lookup
+                dictionary as :meth:`pose`. ``None`` uses the constructor
+                default, or the template T-pose if none was set. Cannot be
+                combined with ``absolute_pose=True``.
+
+        Returns:
+            ``(poses, translation, fps)``: rotation matrices of shape
+            ``(T, 25, 3, 3)``, wrist world translations of shape ``(T, 3)``, and
+            the animation sample rate. Tensors use this layer's device and dtype.
+            Pass them to :meth:`pose` with ``pose2rot=False``,
+            ``global_translation=translation``, and the same ``absolute_pose`` /
+            ``reference_pose`` arguments. Do not apply a separate wrist transform.
+        """
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if reference_pose is None and not absolute_pose:
+            reference_pose = self._default_reference_pose
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
+        if reference_pose is not None:
+            reference_pose = validate_reference_pose(
+                reference_pose, len(self.joint_parent_ids), require_identity_root=False
+            )
+
+        transforms, fps = load_soma_animation(path, self.rig_data["joint_names"], world_space=True)
+        world = torch.from_numpy(transforms).to(self.t_pose_world)
+        rotations = joint_world_to_local(world[..., :3, :3], self.joint_parent_ids)
+        if not absolute_pose:
+            if reference_pose is None:
+                reference_pose = self.t_pose_world
+            orient, orient_parent_T = precompute_joint_orient(
+                reference_pose.to(world), self.joint_parent_ids
+            )
+            rotations = remove_joint_orient_local(rotations, orient, orient_parent_T)
+        translation = world[:, 0, :3, 3] / self.output_unit.meters_per_unit
+        return rotations, translation, fps
+
     def _apply_lod_transfer(self, mid_rest_shape: torch.Tensor) -> torch.Tensor:
         if self.identity_lod_mid_ids is not None:
             return mid_rest_shape[:, self.identity_lod_mid_ids, :]
@@ -1143,6 +1202,11 @@ class SOMAHandLayer(nn.Module):
                     "a valid correctives_model_path or pass apply_correctives=False."
                 )
             correctives_input = poses_rot if absolute_pose else self._apply_joint_orient(poses_rot)
+            # The standalone wrist is a global rigid rotation, not articulation.
+            correctives_input = correctives_input.clone()
+            correctives_input[:, 0] = torch.eye(
+                3, device=correctives_input.device, dtype=correctives_input.dtype
+            )
             out_correctives = self.correctives_model(correctives_input)["out"]
             frame_rot = self._correctives_to_hand_frame.to(
                 dtype=out_correctives.dtype,

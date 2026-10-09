@@ -18,7 +18,6 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from soma import SOMALayer
-from soma.geometry.rig_utils import joint_local_to_world, joint_world_to_local
 from tools.logging_utils import add_logging_args, configure_logging
 from tools.vis_pyrender import (
     MeshRenderer,
@@ -28,54 +27,6 @@ from tools.vis_pyrender import (
 )
 
 logger = logging.getLogger(__name__)
-
-# --------------------------------------------------------------------------------
-# Joint Names & Mapping
-# --------------------------------------------------------------------------------
-# fmt: off
-nvskel93_name = [
-    "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw",
-    "LeftEye", "RightEye", "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd",
-    "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd",
-    "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd",
-    "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4", "LeftHandRingEnd",
-    "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd",
-    "LeftForeArmTwist1", "LeftForeArmTwist2", "LeftArmTwist1", "LeftArmTwist2",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-    "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd",
-    "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd",
-    "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd",
-    "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4", "RightHandRingEnd",
-    "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd",
-    "RightForeArmTwist1", "RightForeArmTwist2", "RightArmTwist1", "RightArmTwist2",
-    "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "LeftToeEnd",
-    "LeftShinTwist1", "LeftShinTwist2", "LeftLegTwist1", "LeftLegTwist2",
-    "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd",
-    "RightShinTwist1", "RightShinTwist2", "RightLegTwist1", "RightLegTwist2",
-]
-
-nvskel77_name = [
-    "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw",
-    "LeftEye", "RightEye",
-    "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd",
-    "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd",
-    "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd",
-    "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4", "LeftHandRingEnd",
-    "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-    "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd",
-    "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd",
-    "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd",
-    "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4", "RightHandRingEnd",
-    "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd",
-    "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "LeftToeEnd",
-    "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd",
-]
-
-# fmt: on
-nvskel93to77_idx = [nvskel93_name.index(name) for name in nvskel77_name]
 
 color_map = {
     "soma": (0.4, 0.8, 0.4, 1.0),  # light green
@@ -139,8 +90,8 @@ def main():
     parser.add_argument("--data-root", default="assets", help="Path to SOMA assets")
     parser.add_argument(
         "--motion-file",
-        default="assets/example_animation.npy",
-        help="Path to motion file (.npy). If None, uses a dummy motion.",
+        default="assets/example_animation.usd",
+        help="Path to a SOMA USD animation. An empty string uses a dummy motion.",
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", default="out/vis_identity_model")
@@ -304,68 +255,33 @@ def main():
 
     reference_model = models[model_specs[0][0]]
 
-    if args.motion_file and os.path.exists(args.motion_file):
+    fps = 30.0
+    if args.motion_file:
         logger.info(f"Loading motion from {args.motion_file}...")
-        motion_full = torch.from_numpy(np.load(args.motion_file)).float().to(device)
-        joint_rot_mats_local = motion_full[..., :3, :3]
-        root_trans = motion_full[..., 1, :3, 3]
+        pose, root_trans, fps = reference_model.load_motion(args.motion_file)
     else:
-        logger.info(
-            "No motion file provided or file not found. Using dummy motion (T-pose rotation)."
-        )
+        logger.info("No motion file provided. Using dummy motion (T-pose rotation).")
         T = 30
-        joint_rot_mats_local = (
-            torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).repeat(T, 78, 1, 1)
-        )
+        pose = torch.eye(3, device=device).view(1, 1, 3, 3).repeat(T, 77, 1, 1)
         angle = torch.linspace(0, 2 * np.pi, T, device=device)
         cos = torch.cos(angle)
         sin = torch.sin(angle)
         zeros = torch.zeros_like(angle)
         ones = torch.ones_like(angle)
-        rot_y = torch.stack(
+        pose[:, 0] = torch.stack(
             [
                 torch.stack([cos, zeros, sin], dim=-1),
                 torch.stack([zeros, ones, zeros], dim=-1),
                 torch.stack([-sin, zeros, cos], dim=-1),
             ],
             dim=-2,
-        )  # (T, 3, 3)
-        joint_rot_mats_local[:, 1] = rot_y  # Rotate Hips
+        )
         root_trans = torch.zeros(T, 3, device=device)
 
-    if joint_rot_mats_local.shape[1] == 94:
-        subset_idx = [0] + [i + 1 for i in nvskel93to77_idx]
-        joint_rot_mats_local = joint_rot_mats_local[:, subset_idx]
     if args.max_frames > 0:
-        joint_rot_mats_local = joint_rot_mats_local[: args.max_frames]
+        pose = pose[: args.max_frames]
         root_trans = root_trans[: args.max_frames]
-
-    reference_transform_joint_indices = getattr(
-        reference_model,
-        "public_transform_joint_indices",
-        torch.arange(reference_model.t_pose_world.shape[0], device=device),
-    )
-    reference_parent_ids = getattr(
-        reference_model,
-        "public_joint_parent_ids",
-        reference_model.joint_parent_ids,
-    )
-    reference_t_pose_world = reference_model.t_pose_world[reference_transform_joint_indices]
-    correction = reference_t_pose_world[:, :3, :3].transpose(-2, -1)
-    joint_rot_mats_world = joint_local_to_world(
-        joint_rot_mats_local,
-        reference_parent_ids,
-    )
-    joint_rot_mats_world = joint_rot_mats_world @ correction
-    joint_rot_mats_local = joint_world_to_local(
-        joint_rot_mats_world,
-        reference_parent_ids,
-    )
-
-    T = joint_rot_mats_local.shape[0]
-    global_orient = joint_rot_mats_local[:T, 1]  # (T, 3, 3) - Hips is index 1
-    body_pose = joint_rot_mats_local[:T, 2:]  # (T, 77, 3, 3)
-    pose = torch.cat([global_orient.unsqueeze(1), body_pose], dim=1)
+    T = pose.shape[0]
 
     # Prepare Identity Parameters
     identity_coeffs_map = {}
@@ -522,7 +438,7 @@ def main():
                 renderer.setup_skeleton(skel_parents, color=skel_color)
             else:
                 renderer.setup_skeleton(skel_parents)
-        writer = imageio.get_writer(out_path, fps=30)
+        writer = imageio.get_writer(out_path, fps=fps)
         for t in tqdm(range(T), desc=model_type):
             verts = outputs[model_type]["vertices"][t].detach().cpu().numpy()
             joints = None

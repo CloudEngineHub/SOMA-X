@@ -5,13 +5,13 @@
 
 Tests both the default ``fit()`` solver (analytical inverse-LBS warm start plus
 Lie-GN refinement) and ``fit(autograd_iters=...)`` (FK-based gradient
-optimization) against ground-truth posed vertices from example_animation.npy.
+optimization) against ground-truth posed vertices from example_animation.usd.
 
 Pose conventions
 ~~~~~~~~~~~~~~~~
-- example_animation.npy stores local rotations *relative to T-pose*
-  (joint orient not applied).  demo_soma_vis.py applies a t-pose
-  correction before passing to ``soma.pose(absolute_pose=False)``.
+- example_animation.usd stores absolute local transforms. The shared USD
+  motion loader removes the SOMA T-pose joint orient before calling
+  ``soma.pose(absolute_pose=False)``.
 
 - Both ``fit()`` and ``fit(autograd_iters=...)`` return *absolute*
   local rotations (joint orient already baked in), suitable for
@@ -23,57 +23,12 @@ Requires CUDA and assets/.
 
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSETS_DIR = REPO_ROOT / "assets"
-MOTION_FILE = ASSETS_DIR / "example_animation.npy"
-
-# 94-joint skeleton to 77-joint mapping (from demo_soma_vis.py)
-# fmt: off
-_NVSKEL93_NAMES = [
-    "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw",
-    "LeftEye", "RightEye", "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd",
-    "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd",
-    "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd",
-    "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4", "LeftHandRingEnd",
-    "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd",
-    "LeftForeArmTwist1", "LeftForeArmTwist2", "LeftArmTwist1", "LeftArmTwist2",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-    "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd",
-    "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd",
-    "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd",
-    "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4", "RightHandRingEnd",
-    "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd",
-    "RightForeArmTwist1", "RightForeArmTwist2", "RightArmTwist1", "RightArmTwist2",
-    "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "LeftToeEnd",
-    "LeftShinTwist1", "LeftShinTwist2", "LeftLegTwist1", "LeftLegTwist2",
-    "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd",
-    "RightShinTwist1", "RightShinTwist2", "RightLegTwist1", "RightLegTwist2",
-]
-_NVSKEL77_NAMES = [
-    "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw",
-    "LeftEye", "RightEye",
-    "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd",
-    "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd",
-    "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd",
-    "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4", "LeftHandRingEnd",
-    "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-    "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd",
-    "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd",
-    "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd",
-    "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4", "RightHandRingEnd",
-    "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd",
-    "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "LeftToeEnd",
-    "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd",
-]
-# fmt: on
-_93TO77_IDX = [_NVSKEL93_NAMES.index(n) for n in _NVSKEL77_NAMES]
+MOTION_FILE = ASSETS_DIR / "example_animation.usd"
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -195,43 +150,8 @@ def test_pose_inversion_uses_automatic_default_rotation_methods():
 
 
 def _load_motion(soma, frames):
-    """Load example_animation.npy frames, return ground-truth posed vertices.
-
-    Follows the same pipeline as tools/demo_soma_vis.py:
-    1. Remap 94-joint → 78-joint (root + 77)
-    2. Apply t-pose correction
-    3. Forward pass through soma.pose()
-
-    Returns (posed_vertices, root_translation).
-    """
-    from soma.geometry.rig_utils import joint_local_to_world, joint_world_to_local
-
-    device = soma.device
-    motion_full = torch.from_numpy(np.load(MOTION_FILE)).float().to(device)
-    rot_local = motion_full[..., :3, :3]
-    root_trans = motion_full[:, 1, :3, 3]
-
-    # Remap 94 → 78 joints (root + 77)
-    if rot_local.shape[1] == 94:
-        subset_idx = [0] + [i + 1 for i in _93TO77_IDX]
-        rot_local = rot_local[:, subset_idx]
-
-    # T-pose correction: animation data is in a different skeleton
-    # convention; rotate world transforms to match SOMA's joint orient.
-    public_rig = soma.public_rig_view()
-    public_parent_ids = public_rig.joint_parent_ids
-    correction = public_rig.t_pose_world[:, :3, :3].transpose(-2, -1)
-    rot_world = joint_local_to_world(rot_local, public_parent_ids)
-    rot_world = rot_world @ correction
-    rot_local = joint_world_to_local(rot_world, public_parent_ids)
-
-    # Build pose: global_orient (Hips=joint 1) + body (joints 2:)
-    global_orient = rot_local[:, 1]
-    body_pose = rot_local[:, 2:]
-    pose = torch.cat([global_orient.unsqueeze(1), body_pose], dim=1)
-    transl = root_trans
-
-    # Select frames
+    """Load selected USD frames and return posed vertices and root translation."""
+    pose, transl, _ = soma.load_motion(MOTION_FILE)
     pose = pose[frames]
     transl = transl[frames]
 
@@ -696,13 +616,27 @@ class TestLieAlgebraGN:
         weighted_heel_err = weighted["per_vertex_error"][:, heel_ids].mean()
         assert weighted_heel_err < 0.5 * unweighted_heel_err
 
-    def test_lie_gn_after_analytical(self, soma_and_inv):
-        """Lie-GN warm-started by analytical solver equals or beats analytical alone."""
+    @pytest.mark.parametrize("allow_tf32", [False, True])
+    def test_lie_gn_after_analytical(self, soma_and_inv, monkeypatch, allow_tf32):
+        """Lie-GN should not significantly worsen its own analytical warm start."""
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", allow_tf32)
         soma, inv = soma_and_inv
         verts, _ = _load_motion(soma, frames=[0, 100, 300, 600])
 
-        result_analytical = inv.fit(verts, body_iters=2, full_iters=1, lie_iters=0)
+        # Fused GPU reductions can produce different analytical fits, especially
+        # with TF32. Capture this call's warm start instead of fitting twice.
+        fit_analytical = inv._fit_analytical
+        analytical_results = []
+
+        def capture_analytical(*args, **kwargs):
+            result = fit_analytical(*args, **kwargs)
+            analytical_results.append(result)
+            return result
+
+        monkeypatch.setattr(inv, "_fit_analytical", capture_analytical)
         result_combined = inv.fit(verts, body_iters=2, full_iters=1, lie_iters=3)
+        assert len(analytical_results) == 1
+        result_analytical = analytical_results[0]
 
         J = result_combined["rotations"].shape[1]
         assert result_combined["rotations"].shape == (4, J, 3, 3)

@@ -25,7 +25,7 @@
     {"source": "assets/SOMA_procedural_transforms.json", "path": "SOMA_procedural_transforms.json"},
     {"source": "assets/SOMA_template_rig.usda", "path": "SOMA_template_rig.usda"},
     {"source": "assets/correctives_model.pt", "path": "correctives_model.pt"},
-    {"source": "assets/example_animation.npy", "path": "example_animation.npy"},
+    {"source": "assets/example_animation.usd", "path": "example_animation.usd"},
     {"source": "assets/images/banner.png", "path": "images/banner.png"},
     {"source": "assets/images/mhr2soma.gif", "path": "images/mhr2soma.gif"},
     {"source": "assets/images/smpl2soma.gif", "path": "images/smpl2soma.gif"},

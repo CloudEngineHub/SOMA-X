@@ -1,10 +1,8 @@
 """Hand-only animation demo for SOMAHandLayer.
 
-Runs FK on the full-body motion to extract the wrist world transform, then
-feeds the 24 finger-joint rotations to SOMAHandLayer, and applies the wrist
-world transform to bring the wrist-local hand mesh into world space for
-rendering. Pass ``--remove-wrist-translation`` to retain the animated wrist
-orientation while keeping the hand centered at the world origin.
+Loads full-body or hand-only USD motion directly through SOMAHandLayer.
+Pass ``--remove-wrist-translation`` to retain the animated wrist orientation
+while keeping the hand centered at the world origin.
 """
 
 import argparse
@@ -24,9 +22,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from soma import SOMAHandLayer  # noqa: E402
-from soma.geometry.rig_utils import joint_local_to_world  # noqa: E402
 from tools.logging_utils import add_logging_args, configure_logging  # noqa: E402
-from tools.soma_rig_assets import load_public_mid_soma_rig  # noqa: E402
 from tools.vis_pyrender import (  # noqa: E402
     MeshRenderer,
     default_pyopengl_platform,
@@ -35,50 +31,6 @@ from tools.vis_pyrender import (  # noqa: E402
 )
 
 logger = logging.getLogger(__name__)
-
-# fmt: off
-# Joint name tables for subsetting 94-joint nvskel93 motions to the 78-joint SOMA skeleton
-_NVSKEL93_NAME = [
-    "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw",
-    "LeftEye", "RightEye", "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd",
-    "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd",
-    "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd",
-    "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4", "LeftHandRingEnd",
-    "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd",
-    "LeftForeArmTwist1", "LeftForeArmTwist2", "LeftArmTwist1", "LeftArmTwist2",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-    "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd",
-    "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd",
-    "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd",
-    "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4", "RightHandRingEnd",
-    "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd",
-    "RightForeArmTwist1", "RightForeArmTwist2", "RightArmTwist1", "RightArmTwist2",
-    "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "LeftToeEnd",
-    "LeftShinTwist1", "LeftShinTwist2", "LeftLegTwist1", "LeftLegTwist2",
-    "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd",
-    "RightShinTwist1", "RightShinTwist2", "RightLegTwist1", "RightLegTwist2",
-]
-_NVSKEL77_NAME = [
-    "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw",
-    "LeftEye", "RightEye",
-    "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd",
-    "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd",
-    "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd",
-    "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4", "LeftHandRingEnd",
-    "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-    "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd",
-    "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd",
-    "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd",
-    "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4", "RightHandRingEnd",
-    "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd",
-    "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "LeftToeEnd",
-    "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd",
-]
-# fmt: on
-_NVSKEL93TO77_IDX = [_NVSKEL93_NAME.index(name) for name in _NVSKEL77_NAME]
 
 _BACKEND_COLORS = {
     "soma": (0.4, 0.8, 0.4, 1.0),
@@ -104,8 +56,8 @@ def main():
     parser.add_argument("--data-root", default="assets", help="Path to SOMA assets")
     parser.add_argument(
         "--motion-file",
-        default="assets/example_animation.npy",
-        help="Path to motion file (.npy). If not found, uses T-pose.",
+        default="assets/example_animation.usd",
+        help="Path to a full-body or hand-only SOMA USD animation. An empty string uses a centered T-pose.",
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", default="out/demo_hand")
@@ -144,7 +96,7 @@ def main():
         "--apply-correctives",
         action="store_true",
         default=False,
-        help="Apply pose-dependent corrective offsets during the hand-layer forward pass.",
+        help="Apply pose-dependent corrective offsets during the hand-layer forward pass (default: False).",
     )
     parser.add_argument(
         "--shape-only",
@@ -215,33 +167,6 @@ def main():
     data_root = Path(args.data_root)
 
     # ------------------------------------------------------------------ #
-    # FK setup + motion loading (skipped in shape-only mode)
-    # ------------------------------------------------------------------ #
-    if not args.shape_only:
-        rig_data = load_public_mid_soma_rig(data_root)
-        full_parent_ids = torch.from_numpy(rig_data["joint_parent_ids"]).to(device)  # (78,)
-
-        motion_path = Path(args.motion_file)
-        if motion_path.exists():
-            logger.info(f"Loading motion from {motion_path}...")
-            motion_full = torch.from_numpy(np.load(motion_path)).float().to(device)
-        else:
-            logger.info("Motion file not found. Using T-pose (identity rotations).")
-            motion_full = (
-                torch.eye(4, device=device).unsqueeze(0).unsqueeze(0).expand(30, 78, 4, 4).clone()
-            )
-
-        if motion_full.shape[1] == 94:
-            subset_idx = [0] + [i + 1 for i in _NVSKEL93TO77_IDX]
-            motion_full = motion_full[:, subset_idx]
-        if args.max_frames is not None:
-            motion_full = motion_full[: args.max_frames]
-
-        T = motion_full.shape[0]
-        joint_rot_mats = motion_full[..., :3, :3]  # (T, 78, 3, 3)
-        world_4x4 = joint_local_to_world(motion_full, full_parent_ids)  # (T, 78, 4, 4)
-
-    # ------------------------------------------------------------------ #
     # Process each hand type
     # ------------------------------------------------------------------ #
     for hand_type in hand_types:
@@ -259,28 +184,23 @@ def main():
             identity_model_kwargs=identity_model_kwargs,
         ).to(device)
 
-        if args.shape_only:
-            # Fixed T-pose with wrist at world origin; only shape varies.
-            T_cur = (
-                args.num_frames
-                if args.max_frames is None
-                else min(args.num_frames, args.max_frames)
-            )
-            ident3 = torch.eye(3, device=device)
-            finger_poses = ident3.view(1, 1, 3, 3).expand(T_cur, 25, 3, 3).contiguous()
-            wrist_world = torch.eye(4, device=device).unsqueeze(0).expand(T_cur, 4, 4).contiguous()
+        if args.shape_only or not args.motion_file:
+            # Fixed T-pose with wrist at world origin.
+            T_cur = args.num_frames if args.shape_only else 30
+            if args.max_frames is not None:
+                T_cur = min(T_cur, args.max_frames)
+            poses = torch.eye(3, device=device).view(1, 1, 3, 3).expand(T_cur, 25, 3, 3)
+            wrist_translation = torch.zeros(T_cur, 3, device=device)
+            fps = 30.0
         else:
-            T_cur = T
-            # Wrist world transform from FK
-            wrist_world = world_4x4[:, hand_layer.wrist_global_id, :, :]  # (T, 4, 4)
-            # Compute T-pose-relative finger poses for SOMAHandLayer (joint_orient = T-pose).
-            finger_global_ids = hand_layer.hand_joint_ids_global
-            R_motion = joint_rot_mats[:, finger_global_ids]  # (T, 25, 3, 3)
-            hand_t_pose_rots = hand_layer.t_pose_world[:, :3, :3]  # (25, 3, 3)
-            parent_local_ids = hand_layer.joint_parent_ids
-            T_parent = hand_t_pose_rots[parent_local_ids]
-            T_self = hand_t_pose_rots
-            finger_poses = T_parent[None] @ R_motion @ T_self[None].transpose(-2, -1)
+            logger.info(f"Loading motion from {args.motion_file}...")
+            poses, wrist_translation, fps = hand_layer.load_motion(args.motion_file)
+            if args.max_frames is not None:
+                poses = poses[: args.max_frames]
+                wrist_translation = wrist_translation[: args.max_frames]
+            T_cur = poses.shape[0]
+        if args.remove_wrist_translation:
+            wrist_translation = torch.zeros_like(wrist_translation)
 
         # Identity coefficients — smooth random or neutral
         if args.random_shape or args.shape_only:
@@ -294,34 +214,15 @@ def main():
         logger.info("Running forward pass...")
         with torch.no_grad():
             out = hand_layer(
-                finger_poses,
+                poses,
                 identity_coeffs,
                 pose2rot=False,
                 apply_correctives=args.apply_correctives,
+                global_translation=wrist_translation,
             )
 
-        # out["vertices"]: (T_cur, Vh, 3) in wrist-local meters
-        Vh = out["vertices"].shape[1]
-
-        # ------------------------------------------------------------------ #
-        # Apply wrist world transform for rendering
-        # wrist_world is in cm (from FK on SOMA rig); hand verts are in meters.
-        # Scale wrist translation to meters before applying.
-        # ------------------------------------------------------------------ #
-        wrist_world_m = wrist_world.clone()
-        if args.remove_wrist_translation:
-            wrist_world_m[:, :3, 3] = 0
-        else:
-            wrist_world_m[:, :3, 3] *= 0.01  # cm -> m
-        ones = torch.ones(T_cur, Vh, 1, device=device)
-        verts_h = torch.cat([out["vertices"], ones], dim=-1)
-        verts_world = (wrist_world_m[:, None] @ verts_h.unsqueeze(-1)).squeeze(-1)[..., :3]
-
-        joints_world = None
-        if args.skeleton_overlay:
-            # out["joints"]: (T_cur, 25, 3) wrist-local meters -> world, like the vertices.
-            joints_h = torch.cat([out["joints"], torch.ones(T_cur, 25, 1, device=device)], dim=-1)
-            joints_world = (wrist_world_m[:, None] @ joints_h.unsqueeze(-1)).squeeze(-1)[..., :3]
+        verts_world = out["vertices"]
+        joints_world = out["joints"] if args.skeleton_overlay else None
 
         if args.shape_only:
             # Remove per-frame centroid drift so only shape changes, not position.
@@ -390,7 +291,7 @@ def main():
             Path(args.output_dir)
             / f"hand_{hand_type}_{args.identity_model_type}_{corrective_suffix}_{suffix}.mp4"
         )
-        writer = imageio.get_writer(out_path, fps=30)
+        writer = imageio.get_writer(out_path, fps=fps)
         for t in tqdm(range(T_cur), desc=f"Rendering {hand_type}"):
             verts = verts_world[t].detach().cpu().numpy()
             joints = joints_world[t].detach().cpu().numpy() if joints_world is not None else None

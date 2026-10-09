@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.4
+
+Changes from v0.3.3:
+
+- Improves the corrective model, especially around armpits and elbows.
+- Adds a shared animation-loading API for body and hand models.
+- Provides the example animation in USD instead of NPY, with demos using the new API.
+
 ## v0.3.3
 
 Changes from v0.3.2:

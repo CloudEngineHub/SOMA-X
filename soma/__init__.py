@@ -3,7 +3,7 @@
 
 """Public SOMA-X package exports."""
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 import sys as _sys
 
@@ -24,7 +24,9 @@ from .io import (
     load_lod_rig_from_usd,
     load_lod_rigs_from_usd,
     load_rig_from_usd,
+    load_soma_animation,
     load_usd_animation,
+    load_usd_animation_sequence,
     load_usd_mesh,
     load_usd_skeleton,
     load_usd_skinning,
@@ -107,7 +109,9 @@ __all__ = [
     "load_lod_rig_from_usd",
     "load_lod_rigs_from_usd",
     "load_rig_from_usd",
+    "load_soma_animation",
     "load_usd_animation",
+    "load_usd_animation_sequence",
     "load_usd_mesh",
     "load_usd_skeleton",
     "load_usd_skinning",

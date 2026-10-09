@@ -256,6 +256,7 @@ from ..geometry.rig_utils import (
     apply_joint_orient_local,
     joint_world_to_local,
     precompute_joint_orient,
+    remove_joint_orient_local,
 )
 from ..geometry.skeleton_transfer import SkeletonTransfer
 from ..io import (
@@ -263,6 +264,7 @@ from ..io import (
     SOMA_XLO_TEMPLATE_RIG_FILENAME,
     fan_triangulate,
     load_lod_rigs_from_usd,
+    load_soma_animation,
     missing_soma_neutral_rig_keys,
 )
 from ..procedural_transforms import (
@@ -929,14 +931,11 @@ class SOMALayer(nn.Module):
                 f"got {len(legacy_bone_scale_public_joint_indices)}"
             )
         missing_lower_limb_scale_joints = [
-            name
-            for name in self.FOOT_BONE_SCALE_JOINT_NAMES
-            if name not in public_name_to_idx
+            name for name in self.FOOT_BONE_SCALE_JOINT_NAMES if name not in public_name_to_idx
         ]
         if missing_lower_limb_scale_joints:
             raise RuntimeError(
-                "SOMA public rig is missing foot-scaling joints: "
-                f"{missing_lower_limb_scale_joints}"
+                f"SOMA public rig is missing foot-scaling joints: {missing_lower_limb_scale_joints}"
             )
         bone_scale_public_joint_indices = [
             *legacy_bone_scale_public_joint_indices,
@@ -1186,6 +1185,54 @@ class SOMALayer(nn.Module):
             self.output_joint_parent_ids,
             virtual_root=True,
         )
+
+    def load_motion(
+        self,
+        path: str | Path,
+        *,
+        absolute_pose: bool = False,
+        reference_pose: torch.Tensor | dict[str, str] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """Load USD motion for :meth:`pose`, without preparing an identity.
+
+        Args:
+            path: USD animation with all public SOMA joints.
+            absolute_pose: Return absolute local rotations instead of rotations
+                relative to a reference pose. Bypasses the constructor default.
+            reference_pose: Same tensor or :meth:`get_reference_pose` lookup
+                dictionary as :meth:`pose`. ``None`` uses the constructor
+                default, or the template T-pose if none was set. Cannot be
+                combined with ``absolute_pose=True``.
+
+        Returns:
+            ``(poses, translation, fps)``: rotation matrices of shape
+            ``(T, 77, 3, 3)`` without the virtual Root, root translations of shape
+            ``(T, 3)`` in this layer's output units, and the animation sample rate.
+            Tensors use this layer's device and dtype. Pass them to :meth:`pose`
+            with ``pose2rot=False``, ``transl=translation``, and the same
+            ``absolute_pose`` / ``reference_pose`` arguments.
+        """
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if reference_pose is None and not absolute_pose:
+            reference_pose = self._default_reference_pose
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
+        if reference_pose is not None:
+            reference_pose = validate_reference_pose(reference_pose, len(self.public_joint_names))
+
+        transforms, fps = load_soma_animation(path, self.public_joint_names)
+        motion = torch.from_numpy(transforms).to(self.t_pose_world)
+        rotations = motion[..., :3, :3]
+        if not absolute_pose:
+            if reference_pose is None:
+                reference_pose = self.t_pose_world[self.public_transform_joint_indices]
+            orient, orient_parent_T = precompute_joint_orient(
+                reference_pose.to(motion), self.public_joint_parent_ids
+            )
+            rotations = remove_joint_orient_local(rotations, orient, orient_parent_T)
+        translation = motion[:, self.root_joint_idx, :3, 3] / self.output_unit.meters_per_unit
+        return rotations[:, 1:], translation, fps
 
     def public_skinning_weights(self) -> torch.Tensor:
         """Return target skinning weights folded onto the public SOMA hierarchy."""

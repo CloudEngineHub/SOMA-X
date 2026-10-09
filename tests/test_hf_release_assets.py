@@ -222,6 +222,13 @@ def test_v0_3_contract_contains_supported_hand_assets_only() -> None:
     assert hand_media == set()
 
 
+def test_v0_3_contract_ships_usd_example_animation() -> None:
+    contract = json.loads((TOOLS_CI / "hf_assets_v0.3.json").read_text(encoding="utf-8"))
+    examples = [entry for entry in contract["files"] if "example_animation" in entry["source"]]
+
+    assert examples == [{"source": "assets/example_animation.usd", "path": "example_animation.usd"}]
+
+
 def test_top_level_exports_hand_layers() -> None:
     import soma
 
@@ -509,9 +516,7 @@ def test_create_verified_release_tag_rejects_wrong_release_manifest(
     monkeypatch.setattr(
         refs_module,
         "_manifest_bytes",
-        lambda repo_id, revision, token: json.dumps(
-            {"release_tag": "v0.2.2"}
-        ).encode(),
+        lambda repo_id, revision, token: json.dumps({"release_tag": "v0.2.2"}).encode(),
     )
 
     with pytest.raises(ValueError, match="does not match"):
